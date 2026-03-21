@@ -24,5 +24,6 @@ jobs:
           SLACK_USER_TOKEN: ${{ secrets.SLACK_USER_TOKEN }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
+          SLACK_CANVAS_ID: ${{ secrets.SLACK_CANVAS_ID }}
         run: |
-          python get_pins.py --notion --public-only --exclude-assignees "my1806" "Quynh Anh （アイン）" "Kyoichi Watanabe" "Noriyuki Mizuno" "hisatake" "Kunihiro Okamura"
+          python get_pins.py --notion --slack-canvas "$SLACK_CANVAS_ID" --public-only --exclude-assignees "my1806" "Quynh Anh （アイン）" "Kyoichi Watanabe" "Noriyuki Mizuno" "hisatake" "Kunihiro Okamura"

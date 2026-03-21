@@ -1,12 +1,13 @@
 # Slack Pin to Notion Export
 
-Slackの各チャンネルにピン留めされたHPHero-taskタスクと、`#nicehero` / `#knowledge` の直近1週間のスレッドを収集し、Notionページまたは Markdown ファイルに出力するツール。
+Slackの各チャンネルにピン留めされたHPHero-taskタスクと、`#nicehero` / `#knowledge` の直近1週間のスレッドを収集し、Notionページ、Slack Canvas、または Markdown ファイルに出力するツール。
 
 ## 機能
 
 - **ピン留めタスク収集** — 参加中の全チャンネルからHPHero-taskボットが投稿したピン留めメッセージを取得し、タスク名・ステータス・担当者・期日を抽出（「完了」「クローズ」は除外）
 - **直近スレッド収集** — `#nicehero` / `#knowledge` の直近7日間のスレッドと返信を取得（転送メッセージの元スレッドも自動追跡）
 - **Notion出力** — 収集結果をNotionページに構造化して出力
+- **Slack Canvas出力** — 「日付_HPH定例」名の新規Canvasを作成し、親Canvas（定例アジェンダ/議事録）にリンクを追記
 - **Markdownファイル出力** — ローカルにMarkdownファイルとして保存
 - **フィルタ機能** — プライベートチャンネル除外、特定担当者除外に対応
 
@@ -21,6 +22,7 @@ Slackの各チャンネルにピン留めされたHPHero-taskタスクと、`#ni
 - `channels:history` — チャンネルメッセージの読み取り
 - `groups:read` — プライベートチャンネル一覧の取得
 - `users:read` — ユーザー名の解決
+- `canvases:write` — Canvas作成・編集（Canvas出力時のみ）
 
 ### 2. 環境変数
 
@@ -55,6 +57,12 @@ python get_pins.py --notion --public-only
 
 # 特定担当者を除外してNotionに出力
 python get_pins.py --notion --exclude-assignees "担当者A" "担当者B"
+
+# Slack Canvasに出力（親CanvasにリンクされたCanvas「日付_HPH定例」を新規作成）
+python get_pins.py --slack-canvas F09BML7LGGL
+
+# Notion + Slack Canvas 両方に出力
+python get_pins.py --notion --slack-canvas F09BML7LGGL --public-only
 ```
 
 ## GitHub Actions による自動実行
@@ -66,3 +74,4 @@ python get_pins.py --notion --exclude-assignees "担当者A" "担当者B"
 - `SLACK_USER_TOKEN`
 - `NOTION_TOKEN`
 - `NOTION_PAGE_ID`
+- `SLACK_CANVAS_ID` — 親Canvas ID（定例アジェンダ/議事録）

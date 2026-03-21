@@ -599,12 +599,44 @@ def export_to_notion(
     return page_url
 
 
+def export_to_slack_canvas(
+    client: WebClient,
+    parent_canvas_id: str,
+    markdown_text: str,
+) -> str:
+    """新しいCanvasを作成し、親Canvasの末尾にリンクを追記する。新Canvas IDを返す。"""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    title = f"{today}_HPH定例"
+
+    # 1. 新しいCanvasを作成
+    resp = client.canvases_create(
+        title=title,
+        document_content={"type": "markdown", "markdown": markdown_text},
+    )
+    new_canvas_id = resp["canvas_id"]
+    print(f"  Canvas作成完了: {new_canvas_id} ({title})", file=sys.stderr)
+
+    # 2. 親Canvasの末尾にリンクを追記
+    link_md = f"\n[{title}](https://slack.com/docs/{new_canvas_id})\n"
+    client.canvases_edit(
+        canvas_id=parent_canvas_id,
+        changes=[{
+            "operation": "insert_at_end",
+            "document_content": {"type": "markdown", "markdown": link_md},
+        }],
+    )
+    print(f"  親Canvas {parent_canvas_id} にリンクを追記しました", file=sys.stderr)
+
+    return new_canvas_id
+
+
 def main():
     parser = argparse.ArgumentParser(description="Slack ピン留めタスク一覧 + 直近スレッド取得")
     parser.add_argument("--output", "-o", help="Markdown出力先ファイルパス")
     parser.add_argument("--notion", action="store_true", help="Notionページに出力する")
     parser.add_argument("--public-only", action="store_true", help="プライベートチャンネルを除外する")
     parser.add_argument("--exclude-assignees", nargs="*", default=[], help="除外する担当者名のリスト")
+    parser.add_argument("--slack-canvas", metavar="CANVAS_ID", help="親Canvas IDを指定して新規Canvasを作成・リンク追記")
     args = parser.parse_args()
 
     client = get_client()
@@ -847,12 +879,19 @@ def main():
         )
         print(f"Notionページに出力しました: {page_url}", file=sys.stderr)
 
+    if args.slack_canvas:
+        print("\nSlack Canvasに出力中...", file=sys.stderr)
+        new_canvas_id = export_to_slack_canvas(
+            client, args.slack_canvas, output_text,
+        )
+        print(f"Slack Canvasを作成しました: {new_canvas_id}", file=sys.stderr)
+
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:
             f.write(output_text)
         print(f"\n結果を {args.output} に保存しました。", file=sys.stderr)
 
-    if not args.output and not args.notion:
+    if not args.output and not args.notion and not args.slack_canvas:
         print(output_text)
 
 
