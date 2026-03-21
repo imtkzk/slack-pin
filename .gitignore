@@ -1,0 +1,6 @@
+.env
+.venv/
+__pycache__/
+*.pyc
+pinned_messages_summary.md
+.claude/settings.local.json

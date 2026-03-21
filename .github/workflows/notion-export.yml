@@ -1,0 +1,28 @@
+name: Notion Export (Filtered)
+
+on:
+  schedule:
+    # 毎週金曜 9:00 JST (= 0:00 UTC)
+    - cron: '0 0 * * 5'
+  workflow_dispatch: # 手動実行も可能
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run notion export
+        env:
+          SLACK_USER_TOKEN: ${{ secrets.SLACK_USER_TOKEN }}
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
+        run: |
+          python get_pins.py --notion --public-only --exclude-assignees "my1806" "Quynh Anh （アイン）" "Kyoichi Watanabe" "Noriyuki Mizuno" "hisatake" "Kunihiro Okamura"
