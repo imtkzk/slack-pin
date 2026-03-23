@@ -18,7 +18,7 @@ Slackからピン留めタスク一覧と直近スレッドを取得し、Notion
 2. 以下のコマンドを実行:
 
 ```bash
-cd /Users/imoto/Desktop/slack-pin && source .venv/bin/activate && python get_pins.py --notion
+source .venv/bin/activate && python get_pins.py --notion
 ```
 
 3. 実行結果を確認し、NotionページのURLをユーザーに伝える。

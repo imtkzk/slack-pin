@@ -599,25 +599,151 @@ def export_to_notion(
     return page_url
 
 
+def _sanitize_markdown_for_canvas(text: str) -> str:
+    """Slack Canvasで非対応のMarkdown構文を変換する。
+
+    リスト項目内の引用ブロック（`  > ...`）はCanvasでサポートされないため、
+    インデント付きテキストに置換する。
+    """
+    lines = []
+    for line in text.split("\n"):
+        # リスト内引用: "  > ..." → "    ..."
+        if re.match(r"^(\s+)> (.*)$", line):
+            m = re.match(r"^(\s+)> (.*)$", line)
+            lines.append(f"{m.group(1)}  {m.group(2)}")
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _build_canvas_markdown(
+    tasks_by_channel: list[tuple[str, list[dict]]],
+    threads_by_channel: list[tuple[str, list[dict]]],
+    replace_mentions_fn,
+    get_user_name_fn,
+    channel_map_by_name: dict[str, str] | None = None,
+) -> str:
+    """Canvas用のテーブル形式Markdownを生成する。"""
+    if channel_map_by_name is None:
+        channel_map_by_name = {}
+    lines = []
+    now_str = datetime.now(timezone(timedelta(hours=9))).strftime("%Y-%m-%d %H:%M (JST)")
+    lines.append(f"取得日時: {now_str}")
+    lines.append("")
+
+    # --- タスクテーブル（ステータス順にソート） ---
+    all_tasks = []
+    for channel_name, tasks in tasks_by_channel:
+        for t in tasks:
+            all_tasks.append((channel_name, t))
+    all_tasks.sort(key=lambda x: STATUS_ORDER.get(x[1]["status"], 99), reverse=True)
+
+    lines.append("# ピン留めタスク一覧")
+    lines.append("")
+    lines.append("| チャンネル | タスク名 | ステータス | 担当者 | 期日 | 進捗 | 進捗説明 |")
+    lines.append("|-----------|---------|----------|--------|-----|------|---------|")
+    for channel_name, t in all_tasks:
+        assignee = replace_mentions_fn(t["assignee"])
+        task_name = t["task_name"].replace("|", "/")
+        status = t["status"]
+        due = t["due_date"] or "-"
+        lines.append(f"| #{channel_name} | {task_name} | {status} | {assignee} | {due} | | |")
+    lines.append("")
+
+    # --- 直近スレッド（テーブル形式） ---
+    if threads_by_channel:
+        lines.append("---")
+        lines.append("")
+        lines.append(f"# 直近{THREAD_DAYS}日間のスレッド")
+        lines.append("")
+        for channel_name, threads in threads_by_channel:
+            lines.append(f"## #{channel_name}")
+            lines.append("")
+            lines.append("| 投稿者 | 要約 | スレッドリンク | 日時 |")
+            lines.append("|--------|------|---------------|------|")
+            for th in threads:
+                user_name = get_user_name_fn(th["parent_user"])
+                ts_str = format_timestamp(th["parent_ts"])
+                parent_text = replace_mentions_fn(th["parent_text"])
+
+                if th.get("is_forwarded") and th.get("original_thread"):
+                    if th.get("stamp_users"):
+                        user_name = format_stamp_users(
+                            th["stamp_users"], replace_mentions_fn
+                        )
+                    summary = build_original_thread_summary(
+                        th["original_thread"], replace_mentions_fn
+                    )
+                else:
+                    summary = parent_text
+
+                # 要約をテーブルセル用に整形（改行→スペース、パイプをエスケープ、80文字制限）
+                summary_clean = summary.replace("\n", " ").replace("|", "/").strip()
+                if len(summary_clean) > 80:
+                    summary_clean = summary_clean[:80] + "..."
+
+                # スレッドリンク生成
+                thread_link = ""
+                if th.get("is_forwarded") and th.get("original_thread"):
+                    orig = th["original_thread"]
+                    orig_ts_raw = orig["parent"].get("ts", "").replace(".", "")
+                    thread_link = f"https://app.slack.com/archives/{orig['channel_id']}/p{orig_ts_raw}"
+                else:
+                    ch_obj = channel_map_by_name.get(channel_name)
+                    if ch_obj:
+                        ts_raw = th["parent_ts"].replace(".", "")
+                        thread_link = f"https://app.slack.com/archives/{ch_obj}/p{ts_raw}"
+
+                user_name_clean = user_name.replace("|", "/")
+                link_cell = f"[リンク]({thread_link})" if thread_link else "-"
+                lines.append(f"| {user_name_clean} | {summary_clean} | {link_cell} | {ts_str} |")
+            lines.append("")
+
+    # --- MTG用セクション ---
+    lines.append("---")
+    lines.append("")
+    lines.append("# 困ったことや質問、ヘルプ、確認待ちで連絡滞っているところ")
+    lines.append("")
+    lines.append("")
+    lines.append("# その他")
+    lines.append("")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
 def export_to_slack_canvas(
     client: WebClient,
     parent_canvas_id: str,
-    markdown_text: str,
+    tasks_by_channel: list[tuple[str, list[dict]]],
+    threads_by_channel: list[tuple[str, list[dict]]],
+    replace_mentions_fn,
+    get_user_name_fn,
+    channel_map_by_name: dict[str, str] | None = None,
 ) -> str:
     """新しいCanvasを作成し、親Canvasの末尾にリンクを追記する。新Canvas IDを返す。"""
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    title = f"{today}_HPH定例"
+    now = datetime.now(timezone(timedelta(hours=9)))  # JST
+    title = f"{now.strftime('%y/%-m/%-d')}_HPH定例"
+
+    canvas_md = _build_canvas_markdown(
+        tasks_by_channel, threads_by_channel,
+        replace_mentions_fn, get_user_name_fn,
+        channel_map_by_name=channel_map_by_name,
+    )
+    canvas_md = _sanitize_markdown_for_canvas(canvas_md)
 
     # 1. 新しいCanvasを作成
     resp = client.canvases_create(
         title=title,
-        document_content={"type": "markdown", "markdown": markdown_text},
+        document_content={"type": "markdown", "markdown": canvas_md},
     )
     new_canvas_id = resp["canvas_id"]
     print(f"  Canvas作成完了: {new_canvas_id} ({title})", file=sys.stderr)
 
     # 2. 親Canvasの末尾にリンクを追記
-    link_md = f"\n[{title}](https://slack.com/docs/{new_canvas_id})\n"
+    team_id = client.auth_test()["team_id"]
+    canvas_url = f"https://nextstageinc.slack.com/docs/{team_id}/{new_canvas_id}"
+    link_md = f"\n[{title}]({canvas_url})\n"
     client.canvases_edit(
         canvas_id=parent_canvas_id,
         changes=[{
@@ -870,9 +996,10 @@ def main():
 
     output_text = "\n".join(lines)
 
+    channel_name_to_id = {ch["name"]: ch["id"] for ch in channels}
+
     if args.notion:
         print("\nNotionページに出力中...", file=sys.stderr)
-        channel_name_to_id = {ch["name"]: ch["id"] for ch in channels}
         page_url = export_to_notion(
             tasks_by_channel, threads_by_channel, replace_mentions,
             channel_map_by_id_rev=channel_name_to_id,
@@ -882,7 +1009,10 @@ def main():
     if args.slack_canvas:
         print("\nSlack Canvasに出力中...", file=sys.stderr)
         new_canvas_id = export_to_slack_canvas(
-            client, args.slack_canvas, output_text,
+            client, args.slack_canvas,
+            tasks_by_channel, threads_by_channel,
+            replace_mentions, get_user_name,
+            channel_map_by_name=channel_name_to_id,
         )
         print(f"Slack Canvasを作成しました: {new_canvas_id}", file=sys.stderr)
 
