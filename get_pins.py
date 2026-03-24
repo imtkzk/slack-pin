@@ -455,72 +455,23 @@ def export_to_notion(
     child_page_id = child_page["id"]
     print(f"  子ページ作成: {today}", file=sys.stderr)
 
-    # 2. インラインDBを作成
-    db = _notion_api(token, "POST", "databases", {
-        "parent": {"type": "page_id", "page_id": child_page_id},
-        "title": [{"type": "text", "text": {"content": "ピン留めタスク一覧"}}],
-        "is_inline": True,
-        "properties": {
-            "タスク名": {"title": {}},
-            "進捗": {"select": {"options": [
-                {"name": "\U0001f7e2 問題なし", "color": "green"},
-                {"name": "\U0001f7e1 少し注意", "color": "yellow"},
-                {"name": "\U0001f534 ヘルプ必要", "color": "red"},
-            ]}},
-            "進捗説明": {"rich_text": {}},
-            "チャンネル": {"select": {}},
-            "ステータス": {"select": {}},
-            "担当者": {"rich_text": {}},
-            "期日": {"rich_text": {}},
-            "説明": {"rich_text": {}},
-            "リンク": {"url": {}},
-        },
+    # 2. 「共有事項」大見出しを追加
+    _notion_api(token, "PATCH", f"blocks/{child_page_id}/children", {
+        "children": [{
+            "object": "block",
+            "type": "heading_1",
+            "heading_1": {"rich_text": [{"type": "text", "text": {"content": "共有事項"}}]},
+        }],
     })
-    db_id = db["id"]
-    print(f"  DB作成完了 (プロパティ: {list(db.get('properties', {}).keys())})", file=sys.stderr)
 
-    # 3. タスクを行として追加（ステータス順にソート）
-    all_tasks = []
-    for channel_name, tasks in tasks_by_channel:
-        for t in tasks:
-            all_tasks.append((channel_name, t))
-    all_tasks.sort(key=lambda x: STATUS_ORDER.get(x[1]["status"], 99), reverse=True)
-
-    row_count = 0
-    for channel_name, t in all_tasks:
-        assignee = replace_mentions_fn(t["assignee"])
-        description = replace_mentions_fn(t["description"])
-        if len(description) > 2000:
-            description = description[:1997] + "..."
-
-        properties = {
-            "タスク名": {"title": [{"text": {"content": t["task_name"]}}]},
-            "チャンネル": {"select": {"name": f"#{channel_name}"}},
-            "ステータス": {"select": {"name": t["status"]}},
-            "担当者": {"rich_text": [{"text": {"content": assignee}}]} if assignee else {"rich_text": []},
-            "期日": {"rich_text": [{"text": {"content": t["due_date"]}}]} if t["due_date"] else {"rich_text": []},
-            "説明": {"rich_text": [{"text": {"content": description}}]} if description else {"rich_text": []},
-            "リンク": {"url": t["permalink"]} if t["permalink"] else {"url": None},
-        }
-        _notion_api(token, "POST", "pages", {
-            "parent": {"database_id": db_id},
-            "properties": properties,
-        })
-        row_count += 1
-        if row_count % 10 == 0:
-            print(f"  {row_count} 件追加...", file=sys.stderr)
-        time.sleep(0.3)
-
-    print(f"  合計 {row_count} 件をDBに追加しました", file=sys.stderr)
-
-    # 4. スレッドセクション（1つのインラインDBにまとめる）
+    # 3. 直近スレッドセクション（一番上に配置）
     if threads_by_channel:
         # 見出しブロックを追加
         _notion_api(token, "PATCH", f"blocks/{child_page_id}/children", {
             "children": [{
                 "object": "block",
-                "type": "heading_1",
-                "heading_1": {"rich_text": [{"type": "text", "text": {"content": f"直近{THREAD_DAYS}日間のスレッド"}}]},
+                "type": "heading_2",
+                "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"直近{THREAD_DAYS}日間のスレッド"}}]},
             }],
         })
 
@@ -594,6 +545,88 @@ def export_to_notion(
                 time.sleep(0.3)
 
         print(f"  合計 {thread_count} 件のスレッドをDBに追加", file=sys.stderr)
+
+    # 4. ピン留めタスク一覧セクション
+    _notion_api(token, "PATCH", f"blocks/{child_page_id}/children", {
+        "children": [{
+            "object": "block",
+            "type": "heading_1",
+            "heading_1": {"rich_text": [{"type": "text", "text": {"content": "ピン留めタスク一覧"}}]},
+        }],
+    })
+
+    db = _notion_api(token, "POST", "databases", {
+        "parent": {"type": "page_id", "page_id": child_page_id},
+        "title": [{"type": "text", "text": {"content": "ピン留めタスク一覧"}}],
+        "is_inline": True,
+        "properties": {
+            "タスク名": {"title": {}},
+            "進捗": {"select": {"options": [
+                {"name": "\U0001f7e2 問題なし", "color": "green"},
+                {"name": "\U0001f7e1 少し注意", "color": "yellow"},
+                {"name": "\U0001f534 ヘルプ必要", "color": "red"},
+            ]}},
+            "進捗説明": {"rich_text": {}},
+            "チャンネル": {"select": {}},
+            "ステータス": {"select": {}},
+            "担当者": {"rich_text": {}},
+            "期日": {"rich_text": {}},
+            "説明": {"rich_text": {}},
+            "リンク": {"url": {}},
+        },
+    })
+    db_id = db["id"]
+    print(f"  DB作成完了 (プロパティ: {list(db.get('properties', {}).keys())})", file=sys.stderr)
+
+    # タスクを行として追加（ステータス順にソート）
+    all_tasks = []
+    for channel_name, tasks in tasks_by_channel:
+        for t in tasks:
+            all_tasks.append((channel_name, t))
+    all_tasks.sort(key=lambda x: STATUS_ORDER.get(x[1]["status"], 99), reverse=True)
+
+    row_count = 0
+    for channel_name, t in all_tasks:
+        assignee = replace_mentions_fn(t["assignee"])
+        description = replace_mentions_fn(t["description"])
+        if len(description) > 2000:
+            description = description[:1997] + "..."
+
+        properties = {
+            "タスク名": {"title": [{"text": {"content": t["task_name"]}}]},
+            "チャンネル": {"select": {"name": f"#{channel_name}"}},
+            "ステータス": {"select": {"name": t["status"]}},
+            "担当者": {"rich_text": [{"text": {"content": assignee}}]} if assignee else {"rich_text": []},
+            "期日": {"rich_text": [{"text": {"content": t["due_date"]}}]} if t["due_date"] else {"rich_text": []},
+            "説明": {"rich_text": [{"text": {"content": description}}]} if description else {"rich_text": []},
+            "リンク": {"url": t["permalink"]} if t["permalink"] else {"url": None},
+        }
+        _notion_api(token, "POST", "pages", {
+            "parent": {"database_id": db_id},
+            "properties": properties,
+        })
+        row_count += 1
+        if row_count % 10 == 0:
+            print(f"  {row_count} 件追加...", file=sys.stderr)
+        time.sleep(0.3)
+
+    print(f"  合計 {row_count} 件をDBに追加しました", file=sys.stderr)
+
+    # 5. 困ったことや質問セクション
+    _notion_api(token, "PATCH", f"blocks/{child_page_id}/children", {
+        "children": [
+            {
+                "object": "block",
+                "type": "heading_1",
+                "heading_1": {"rich_text": [{"type": "text", "text": {"content": "困ったことや質問、ヘルプ、確認待ちで連絡滞っているところ"}}]},
+            },
+            {
+                "object": "block",
+                "type": "paragraph",
+                "paragraph": {"rich_text": []},
+            },
+        ],
+    })
 
     page_url = f"https://www.notion.so/{child_page_id.replace('-', '')}"
     return page_url
