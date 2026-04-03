@@ -421,8 +421,131 @@ def _notion_api(token: str, method: str, path: str, body: dict | None = None) ->
         resp = httpx.patch(url, headers=headers, json=body, timeout=30)
     else:
         resp = httpx.get(url, headers=headers, timeout=30)
+    if resp.status_code >= 400:
+        print(f"  Notion API エラー: {resp.status_code} {path}", file=sys.stderr)
+        print(f"  レスポンス: {resp.text[:500]}", file=sys.stderr)
     resp.raise_for_status()
     return resp.json()
+
+
+def _make_toggle_heading(text: str) -> dict:
+    """トグル見出し（heading_2, is_toggleable=True）ブロックを生成する。"""
+    return {
+        "object": "block",
+        "type": "heading_2",
+        "heading_2": {
+            "rich_text": [{"type": "text", "text": {"content": text}}],
+            "is_toggleable": True,
+        },
+    }
+
+
+def _append_toggle_heading(token: str, parent_id: str, text: str) -> str:
+    """トグル見出しを追加し、そのブロックIDを返す。"""
+    result = _notion_api(token, "PATCH", f"blocks/{parent_id}/children", {
+        "children": [_make_toggle_heading(text)],
+    })
+    return result["results"][0]["id"]
+
+
+def _find_previous_page_id(token: str, parent_page_id: str, current_page_id: str) -> str | None:
+    """親ページの子ページ一覧から、現在ページの一つ前のページIDを返す。"""
+    children = _notion_api(token, "GET", f"blocks/{parent_page_id}/children?page_size=100")
+    child_pages = [
+        b for b in children.get("results", [])
+        if b["type"] == "child_page" and not b.get("in_trash")
+    ]
+    # created_time降順でソート
+    child_pages.sort(key=lambda b: b["created_time"], reverse=True)
+    current_clean = current_page_id.replace("-", "")
+    found_current = False
+    for page in child_pages:
+        page_clean = page["id"].replace("-", "")
+        if page_clean == current_clean:
+            found_current = True
+            continue
+        if found_current:
+            return page["id"]
+    return None
+
+
+def _copy_progress_from_previous(token: str, parent_page_id: str, current_page_id: str, toggle_id: str) -> bool:
+    """過去ページから「プロジェクト進捗」を探してコピーする。最大5ページ遡る。"""
+    children = _notion_api(token, "GET", f"blocks/{parent_page_id}/children?page_size=100")
+    child_pages = [
+        b for b in children.get("results", [])
+        if b["type"] == "child_page" and not b.get("in_trash")
+    ]
+    child_pages.sort(key=lambda b: b["created_time"], reverse=True)
+    current_clean = current_page_id.replace("-", "")
+
+    # 現在ページより前のページを最大5件チェック
+    found_current = False
+    checked = 0
+    progress_toggle_id = None
+    for page in child_pages:
+        if page["id"].replace("-", "") == current_clean:
+            found_current = True
+            continue
+        if not found_current:
+            continue
+        checked += 1
+        if checked > 5:
+            break
+
+        prev_blocks = _notion_api(token, "GET", f"blocks/{page['id']}/children?page_size=100")
+        for b in prev_blocks.get("results", []):
+            if b["type"] in ("heading_1", "heading_2"):
+                txt = "".join(t.get("plain_text", "") for t in b[b["type"]].get("rich_text", []))
+                if "プロジェクト進捗" in txt:
+                    progress_toggle_id = b["id"]
+                    print(f"  {page['child_page'].get('title','')} からプロジェクト進捗を検出", file=sys.stderr)
+                    break
+        if progress_toggle_id:
+            break
+
+    if not progress_toggle_id:
+        print("  過去ページにプロジェクト進捗セクションが見つかりません。", file=sys.stderr)
+        return False
+
+    # トグル内の子ブロックを取得
+    prev_children = _notion_api(token, "GET", f"blocks/{progress_toggle_id}/children?page_size=100")
+    blocks_to_copy = []
+
+    for b in prev_children.get("results", []):
+        if b["type"] == "table" and b.get("has_children"):
+            # テーブルの行を取得してコピー
+            table_rows = _notion_api(token, "GET", f"blocks/{b['id']}/children?page_size=100")
+            rows = []
+            for row in table_rows.get("results", []):
+                if row["type"] == "table_row":
+                    rows.append({
+                        "type": "table_row",
+                        "table_row": {"cells": row["table_row"]["cells"]},
+                    })
+            blocks_to_copy.append({
+                "type": "table",
+                "table": {
+                    "table_width": b["table"]["table_width"],
+                    "has_column_header": b["table"]["has_column_header"],
+                    "has_row_header": b["table"].get("has_row_header", False),
+                    "children": rows,
+                },
+            })
+        elif b["type"] == "paragraph":
+            blocks_to_copy.append({
+                "type": "paragraph",
+                "paragraph": {"rich_text": b["paragraph"].get("rich_text", [])},
+            })
+
+    if blocks_to_copy:
+        _notion_api(token, "PATCH", f"blocks/{toggle_id}/children", {
+            "children": blocks_to_copy,
+        })
+        print("  前回ページからプロジェクト進捗をコピーしました。", file=sys.stderr)
+        return True
+
+    return False
 
 
 def export_to_notion(
@@ -455,29 +578,51 @@ def export_to_notion(
     child_page_id = child_page["id"]
     print(f"  子ページ作成: {today}", file=sys.stderr)
 
-    # 2. 「共有事項」大見出しを追加
+    # 2. 「共有事項」トグル見出し（空）
+    _append_toggle_heading(token, child_page_id, "共有事項")
+
+    # 3. 「直近スレッド」見出し + チャンネルごとのDB
     _notion_api(token, "PATCH", f"blocks/{child_page_id}/children", {
         "children": [{
             "object": "block",
-            "type": "heading_1",
-            "heading_1": {"rich_text": [{"type": "text", "text": {"content": "共有事項"}}]},
+            "type": "heading_2",
+            "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"直近{THREAD_DAYS}日間のスレッド"}}]},
         }],
     })
 
-    # 3. 直近スレッドセクション（一番上に配置）
-    if threads_by_channel:
-        # 見出しブロックを追加
+    # threads_by_channel を dict に変換（チャンネル名 → スレッド一覧）
+    threads_dict: dict[str, list[dict]] = {}
+    for channel_name, threads in (threads_by_channel or []):
+        threads_dict[channel_name] = threads
+
+    total_thread_count = 0
+    for ch_name in THREAD_CHANNELS:
+        threads = threads_dict.get(ch_name, [])
+
+        # チャンネル見出しを追加
         _notion_api(token, "PATCH", f"blocks/{child_page_id}/children", {
             "children": [{
                 "object": "block",
-                "type": "heading_2",
-                "heading_2": {"rich_text": [{"type": "text", "text": {"content": f"直近{THREAD_DAYS}日間のスレッド"}}]},
+                "type": "heading_3",
+                "heading_3": {"rich_text": [{"type": "text", "text": {"content": f"#{ch_name}"}}]},
             }],
         })
 
+        if not threads:
+            _notion_api(token, "PATCH", f"blocks/{child_page_id}/children", {
+                "children": [{
+                    "object": "block",
+                    "type": "paragraph",
+                    "paragraph": {"rich_text": [{"type": "text", "text": {"content": "なし"}}]},
+                }],
+            })
+            print(f"  #{ch_name}: スレッドなし", file=sys.stderr)
+            continue
+
+        # チャンネルごとにDBを作成
         thread_db = _notion_api(token, "POST", "databases", {
             "parent": {"type": "page_id", "page_id": child_page_id},
-            "title": [{"type": "text", "text": {"content": " / ".join(f"#{name}" for name, _ in threads_by_channel) + " スレッド"}}],
+            "title": [{"type": "text", "text": {"content": f"#{ch_name} スレッド"}}],
             "is_inline": True,
             "properties": {
                 "投稿者": {"title": {}},
@@ -488,70 +633,70 @@ def export_to_notion(
             },
         })
         thread_db_id = thread_db["id"]
-        print(f"  スレッドDB作成", file=sys.stderr)
+        print(f"  #{ch_name} スレッドDB作成", file=sys.stderr)
 
-        thread_count = 0
-        for channel_name, threads in threads_by_channel:
-            thread_ch = channel_map_by_id_rev.get(channel_name)
+        thread_ch = channel_map_by_id_rev.get(ch_name)
 
-            for th in threads:
-                parent_text = replace_mentions_fn(th["parent_text"])
-                poster = replace_mentions_fn(th["parent_user"])
-                ts_str = format_timestamp(th["parent_ts"])
-                summary = summarize_thread(parent_text)
-                orig_channel = ""
+        for th in threads:
+            parent_text = replace_mentions_fn(th["parent_text"])
+            poster = replace_mentions_fn(th["parent_user"])
+            ts_str = format_timestamp(th["parent_ts"])
+            summary = summarize_thread(parent_text)
+            orig_channel = ""
 
-                # 内容リンク: Slackのパーマリンクを生成
-                content_link = None
-                if th.get("is_forwarded") and th.get("original_thread"):
-                    orig = th["original_thread"]
-                    orig_ts_raw = orig["parent"].get("ts", "").replace(".", "")
-                    content_link = f"https://app.slack.com/archives/{orig['channel_id']}/p{orig_ts_raw}"
-                elif thread_ch:
-                    ts_raw = th["parent_ts"].replace(".", "")
-                    content_link = f"https://app.slack.com/archives/{thread_ch}/p{ts_raw}"
+            content_link = None
+            if th.get("is_forwarded") and th.get("original_thread"):
+                orig = th["original_thread"]
+                orig_ts_raw = orig["parent"].get("ts", "").replace(".", "")
+                content_link = f"https://app.slack.com/archives/{orig['channel_id']}/p{orig_ts_raw}"
+            elif thread_ch:
+                ts_raw = th["parent_ts"].replace(".", "")
+                content_link = f"https://app.slack.com/archives/{thread_ch}/p{ts_raw}"
 
-                # 転送メッセージの場合、元スレッド情報で上書き
-                if th.get("is_forwarded") and th.get("original_thread"):
-                    orig_channel = th["original_thread"].get("channel_name", "")
-
-                    if th.get("stamp_users"):
-                        poster = format_stamp_users(
-                            th["stamp_users"], replace_mentions_fn
-                        )
-
-                    summary = build_original_thread_summary(
-                        th["original_thread"], replace_mentions_fn
+            if th.get("is_forwarded") and th.get("original_thread"):
+                orig_channel = th["original_thread"].get("channel_name", "")
+                if th.get("stamp_users"):
+                    poster = format_stamp_users(
+                        th["stamp_users"], replace_mentions_fn
                     )
-                    if len(summary) > 2000:
-                        summary = summary[:1997] + "..."
+                summary = build_original_thread_summary(
+                    th["original_thread"], replace_mentions_fn
+                )
+                if len(summary) > 2000:
+                    summary = summary[:1997] + "..."
 
-                properties = {
-                    "投稿者": {"title": [{"text": {"content": poster}}]},
-                    "要約": {"rich_text": [{"text": {"content": summary}}]},
-                    "日時": {"rich_text": [{"text": {"content": ts_str}}]},
-                    "内容リンク": {"url": content_link},
-                }
-                if orig_channel:
-                    properties["元チャンネル"] = {"select": {"name": f"#{orig_channel}"}}
-                else:
-                    properties["元チャンネル"] = {"select": None}
+            properties = {
+                "投稿者": {"title": [{"text": {"content": poster}}]},
+                "要約": {"rich_text": [{"text": {"content": summary}}]},
+                "日時": {"rich_text": [{"text": {"content": ts_str}}]},
+                "内容リンク": {"url": content_link},
+            }
+            if orig_channel:
+                properties["元チャンネル"] = {"select": {"name": f"#{orig_channel}"}}
+            else:
+                properties["元チャンネル"] = {"select": None}
 
-                _notion_api(token, "POST", "pages", {
-                    "parent": {"database_id": thread_db_id},
-                    "properties": properties,
-                })
-                thread_count += 1
-                time.sleep(0.3)
+            _notion_api(token, "POST", "pages", {
+                "parent": {"database_id": thread_db_id},
+                "properties": properties,
+            })
+            total_thread_count += 1
+            time.sleep(0.3)
 
-        print(f"  合計 {thread_count} 件のスレッドをDBに追加", file=sys.stderr)
+        print(f"  #{ch_name}: {total_thread_count} 件のスレッドをDBに追加", file=sys.stderr)
 
-    # 4. ピン留めタスク一覧セクション
+    print(f"  合計 {total_thread_count} 件のスレッドを追加", file=sys.stderr)
+
+    # 4. 「プロジェクト進捗」トグル見出し（前回ページからコピー）
+    progress_toggle_id = _append_toggle_heading(token, child_page_id, "プロジェクト進捗")
+    _copy_progress_from_previous(token, page_id, child_page_id, progress_toggle_id)
+
+    # 5. 「ピン留めタスク一覧」見出し + DB
     _notion_api(token, "PATCH", f"blocks/{child_page_id}/children", {
         "children": [{
             "object": "block",
-            "type": "heading_1",
-            "heading_1": {"rich_text": [{"type": "text", "text": {"content": "ピン留めタスク一覧"}}]},
+            "type": "heading_2",
+            "heading_2": {"rich_text": [{"type": "text", "text": {"content": "ピン留めタスク一覧"}}]},
         }],
     })
 
@@ -576,9 +721,9 @@ def export_to_notion(
         },
     })
     db_id = db["id"]
-    print(f"  DB作成完了 (プロパティ: {list(db.get('properties', {}).keys())})", file=sys.stderr)
+    print(f"  タスクDB作成完了", file=sys.stderr)
 
-    # タスクを行として追加（ステータス順にソート）
+    # タスクをステータス順にソート
     all_tasks = []
     for channel_name, tasks in tasks_by_channel:
         for t in tasks:
@@ -610,22 +755,18 @@ def export_to_notion(
             print(f"  {row_count} 件追加...", file=sys.stderr)
         time.sleep(0.3)
 
-    print(f"  合計 {row_count} 件をDBに追加しました", file=sys.stderr)
+    print(f"  合計 {row_count} 件のタスクをDBに追加しました", file=sys.stderr)
 
-    # 5. 困ったことや質問セクション
-    _notion_api(token, "PATCH", f"blocks/{child_page_id}/children", {
-        "children": [
-            {
-                "object": "block",
-                "type": "heading_1",
-                "heading_1": {"rich_text": [{"type": "text", "text": {"content": "困ったことや質問、ヘルプ、確認待ちで連絡滞っているところ"}}]},
-            },
-            {
-                "object": "block",
-                "type": "paragraph",
-                "paragraph": {"rich_text": []},
-            },
-        ],
+    # 6. 「困ったことや質問」トグル見出し + 空パラグラフ
+    help_toggle_id = _append_toggle_heading(
+        token, child_page_id, "困ったことや質問、ヘルプ、確認待ちで連絡滞っているところ"
+    )
+    _notion_api(token, "PATCH", f"blocks/{help_toggle_id}/children", {
+        "children": [{
+            "object": "block",
+            "type": "paragraph",
+            "paragraph": {"rich_text": []},
+        }],
     })
 
     page_url = f"https://www.notion.so/{child_page_id.replace('-', '')}"
