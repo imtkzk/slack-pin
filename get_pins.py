@@ -255,6 +255,11 @@ def build_original_thread_summary(
 
     parts = []
 
+    parent_user = parent.get("user", "")
+    if parent_user:
+        parent_name = replace_mentions_fn(f"<@{parent_user}>")
+        parts.append(f"投稿者: {parent_name}")
+
     parent_text = replace_mentions_fn(parent.get("text", ""))
     if len(parent_text) > 200:
         parent_text = parent_text[:200] + "..."
@@ -469,6 +474,100 @@ def _find_previous_page_id(token: str, parent_page_id: str, current_page_id: str
     return None
 
 
+def _sanitize_rich_text_for_copy(rich_text: list[dict]) -> list[dict]:
+    """過去ページから取得した rich_text を、書き込み API に送信可能な形に正規化する。
+
+    - text: content と link のみ残す
+    - mention: 書き込み可能な user/page/database/date のみ残し、それ以外（link_preview、
+      template_mention、discriminator 欠落など）は plain_text のテキストに変換する
+    - equation: expression のみ残す
+    - 未知の型は plain_text のテキストに変換する
+    """
+    result: list[dict] = []
+    for rt in rich_text or []:
+        rt_type = rt.get("type")
+        plain = rt.get("plain_text", "") or ""
+        href = rt.get("href")
+        ann = rt.get("annotations") or {}
+        clean_ann = {
+            k: ann[k] for k in ("bold", "italic", "strikethrough", "underline", "code", "color")
+            if k in ann
+        }
+
+        if rt_type == "text":
+            text_field = rt.get("text") or {}
+            text_obj: dict = {"content": text_field.get("content", plain)}
+            link = text_field.get("link")
+            if link and link.get("url"):
+                text_obj["link"] = {"url": link["url"]}
+            item: dict = {"type": "text", "text": text_obj}
+            if clean_ann:
+                item["annotations"] = clean_ann
+            result.append(item)
+            continue
+
+        if rt_type == "mention":
+            mention = rt.get("mention") or {}
+            m_type = mention.get("type")
+            new_mention: dict | None = None
+            if m_type == "user":
+                user = mention.get("user") or {}
+                if user.get("id"):
+                    new_mention = {"user": {"id": user["id"]}}
+            elif m_type == "page":
+                page = mention.get("page") or {}
+                if page.get("id"):
+                    new_mention = {"page": {"id": page["id"]}}
+            elif m_type == "database":
+                db = mention.get("database") or {}
+                if db.get("id"):
+                    new_mention = {"database": {"id": db["id"]}}
+            elif m_type == "date":
+                date = mention.get("date") or {}
+                if date.get("start"):
+                    d: dict = {"start": date["start"]}
+                    if date.get("end"):
+                        d["end"] = date["end"]
+                    if date.get("time_zone"):
+                        d["time_zone"] = date["time_zone"]
+                    new_mention = {"date": d}
+
+            if new_mention is not None:
+                item = {"type": "mention", "mention": new_mention}
+                if clean_ann:
+                    item["annotations"] = clean_ann
+                result.append(item)
+                continue
+            # 書き込み不可な mention はテキスト化
+            if plain:
+                text_obj = {"content": plain}
+                if href:
+                    text_obj["link"] = {"url": href}
+                item = {"type": "text", "text": text_obj}
+                if clean_ann:
+                    item["annotations"] = clean_ann
+                result.append(item)
+            continue
+
+        if rt_type == "equation":
+            expr = (rt.get("equation") or {}).get("expression", "")
+            if expr:
+                item = {"type": "equation", "equation": {"expression": expr}}
+                if clean_ann:
+                    item["annotations"] = clean_ann
+                result.append(item)
+            continue
+
+        # 未知の型: plain_text にフォールバック
+        if plain:
+            item = {"type": "text", "text": {"content": plain}}
+            if clean_ann:
+                item["annotations"] = clean_ann
+            result.append(item)
+
+    return result
+
+
 def _copy_progress_from_previous(token: str, parent_page_id: str, current_page_id: str, toggle_id: str) -> bool:
     """過去ページから「プロジェクト進捗」を探してコピーする。最大5ページ遡る。"""
     children = _notion_api(token, "GET", f"blocks/{parent_page_id}/children?page_size=100")
@@ -519,9 +618,13 @@ def _copy_progress_from_previous(token: str, parent_page_id: str, current_page_i
             rows = []
             for row in table_rows.get("results", []):
                 if row["type"] == "table_row":
+                    sanitized_cells = [
+                        _sanitize_rich_text_for_copy(cell)
+                        for cell in row["table_row"].get("cells", [])
+                    ]
                     rows.append({
                         "type": "table_row",
-                        "table_row": {"cells": row["table_row"]["cells"]},
+                        "table_row": {"cells": sanitized_cells},
                     })
             blocks_to_copy.append({
                 "type": "table",
@@ -535,7 +638,7 @@ def _copy_progress_from_previous(token: str, parent_page_id: str, current_page_i
         elif b["type"] == "paragraph":
             blocks_to_copy.append({
                 "type": "paragraph",
-                "paragraph": {"rich_text": b["paragraph"].get("rich_text", [])},
+                "paragraph": {"rich_text": _sanitize_rich_text_for_copy(b["paragraph"].get("rich_text", []))},
             })
 
     if blocks_to_copy:
@@ -639,7 +742,7 @@ def export_to_notion(
 
         for th in threads:
             parent_text = replace_mentions_fn(th["parent_text"])
-            poster = replace_mentions_fn(th["parent_user"])
+            poster = replace_mentions_fn(f"<@{th['parent_user']}>") if th["parent_user"] else ""
             ts_str = format_timestamp(th["parent_ts"])
             summary = summarize_thread(parent_text)
             orig_channel = ""
@@ -1056,18 +1159,22 @@ def main():
     for _, threads in threads_by_channel:
         for th in threads:
             all_texts.append(th["parent_text"])
-            all_texts.append(th["parent_user"])
+            if th["parent_user"]:
+                all_texts.append(f"<@{th['parent_user']}>")
             for r in th["replies"]:
                 all_texts.append(r.get("text", ""))
-                all_texts.append(r.get("user", ""))
+                if r.get("user"):
+                    all_texts.append(f"<@{r['user']}>")
             # 転送元スレッドのユーザーIDも収集
             if th.get("original_thread"):
                 orig = th["original_thread"]
                 all_texts.append(orig["parent"].get("text", ""))
-                all_texts.append(orig["parent"].get("user", ""))
+                if orig["parent"].get("user"):
+                    all_texts.append(f"<@{orig['parent']['user']}>")
                 for r in orig["replies"]:
                     all_texts.append(r.get("text", ""))
-                    all_texts.append(r.get("user", ""))
+                    if r.get("user"):
+                        all_texts.append(f"<@{r['user']}>")
             for _emoji, uid in th.get("stamp_users", []):
                 all_texts.append(f"<@{uid}>")
 
