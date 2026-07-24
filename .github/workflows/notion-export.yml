@@ -6,6 +6,10 @@ on:
     - cron: '0 7 * * 4'
   workflow_dispatch: # 手動実行も可能
 
+permissions:
+  contents: read
+  actions: write # keepalive（ワークフロー再有効化）に必要
+
 jobs:
   export:
     runs-on: ubuntu-latest
@@ -26,3 +30,11 @@ jobs:
           NOTION_PAGE_ID: ${{ secrets.NOTION_PAGE_ID }}
         run: |
           python get_pins.py --notion --public-only --exclude-assignees "my1806" "Quynh Anh （アイン）" "Kyoichi Watanabe" "Noriyuki Mizuno" "hisatake" "Kunihiro Okamura"
+
+      # コミットが60日間なくてもスケジュール実行が自動停止されないよう、
+      # 実行のたびに自分自身を再有効化して非アクティブタイマーをリセットする
+      - name: Keepalive (prevent 60-day inactivity disable)
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/notion-export.yml/enable"
