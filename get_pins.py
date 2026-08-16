@@ -35,6 +35,8 @@ load_dotenv()
 
 HPHERO_TASK_BOT_ID = "B06G6150AV6"
 EXCLUDED_STATUSES = {"完了", "クローズ"}
+# ピン留めタスク取得対象の最古日時（これより前に投稿されたメッセージは除外）
+PIN_MIN_TS = datetime(2026, 1, 1, tzinfo=timezone(timedelta(hours=9))).timestamp()
 THREAD_CHANNELS = ["nicehero", "knowledge"]
 THREAD_CHANNEL_EMOJI = {
     "nicehero": "hero-blue",
@@ -42,6 +44,32 @@ THREAD_CHANNEL_EMOJI = {
 }
 THREAD_DAYS = 7
 STATUS_ORDER = {"対応中": 0, "保留": 1, "未着手": 2}
+
+# 「プロジェクト進捗」テーブルの担当者列
+PROGRESS_ASSIGNEE_HEADER = "担当者"
+# キーは Client 名（正規化して前方一致で照合、長いキー優先）
+PROJECT_ASSIGNEES = {
+    "hermana": "@Yuka Sasa",
+    "morpho-recruit": "@Yuka Sasa",
+    "morpho": "@Yuka Sasa",
+    "miraima": "@megu",
+    "infront": "@Imoto",
+    "animo": "@Yuka Sasa",
+    "nexpert": "@Reina Tsuji",
+    "fantasy": "@Shiori Shimazaki",
+    "fixstar": "@Imoto",
+    "everbrew": "@Yoshi",
+    "esco": "@Imoto",
+    "misasagikai": "@Imoto",
+    "ロッツフル": "@kazumi endo",
+    "lotsful": "@kazumi endo",
+    "pureheart": "@Imoto",
+    "sauna": "@megu",
+}
+# 表記ゆれ（前方一致では拾えない Client 名）→ PROJECT_ASSIGNEES のキー
+PROJECT_NAME_ALIASES = {
+    "misasaggikai": "misasagikai",
+}
 
 
 def get_client() -> WebClient:
@@ -87,6 +115,14 @@ def parse_task_info(pin: dict) -> dict | None:
     msg = pin.get("message", {})
 
     if msg.get("bot_id") != HPHERO_TASK_BOT_ID:
+        return None
+
+    # 2026年以降に投稿されたメッセージのみ対象
+    ts_raw = msg.get("ts", "")
+    try:
+        if float(ts_raw) < PIN_MIN_TS:
+            return None
+    except (TypeError, ValueError):
         return None
 
     text = msg.get("text", "")
@@ -568,6 +604,76 @@ def _sanitize_rich_text_for_copy(rich_text: list[dict]) -> list[dict]:
     return result
 
 
+def _normalize_project_name(name: str) -> str:
+    """Client 名を照合用に正規化する（小文字化・記号/空白除去）。"""
+    return re.sub(r"[\s　_\-‐―ー・/（）()]+", "", name).lower()
+
+
+def _lookup_assignee(client_name: str) -> str:
+    """Client 名から担当者メンションを引く。見つからなければ空文字。"""
+    norm = _normalize_project_name(client_name)
+    if not norm:
+        return ""
+    norm = PROJECT_NAME_ALIASES.get(norm, norm)
+    # 長いキーを優先（morpho-recruit が morpho より先にマッチするように）
+    for key in sorted(PROJECT_ASSIGNEES, key=len, reverse=True):
+        key_norm = _normalize_project_name(key)
+        if norm == key_norm or norm.startswith(key_norm):
+            return PROJECT_ASSIGNEES[key]
+        # Client 名がキーより短い略称のケース（誤爆防止に4文字以上に限定）
+        if len(norm) >= 4 and key_norm.startswith(norm):
+            return PROJECT_ASSIGNEES[key]
+    return ""
+
+
+def _cell_plain_text(cell: list[dict]) -> str:
+    """rich_text セルの文字列を取り出す（API取得直後／コピー用に整形済みの両形式に対応）。"""
+    parts = []
+    for item in cell:
+        parts.append(item.get("plain_text") or item.get("text", {}).get("content", ""))
+    return "".join(parts)
+
+
+def _text_cell(content: str) -> list[dict]:
+    return [{"type": "text", "text": {"content": content}}] if content else []
+
+
+def _apply_assignee_column(rows: list[dict], width: int, has_column_header: bool) -> tuple[list[dict], int]:
+    """進捗テーブルに担当者列を追加/更新する。(行, 新しい列数) を返す。"""
+    if not rows:
+        return rows, width
+
+    # 既存の担当者列を探す（無ければ末尾に新設）
+    col = None
+    if has_column_header:
+        header_cells = rows[0]["table_row"]["cells"]
+        for i, cell in enumerate(header_cells):
+            if _cell_plain_text(cell).strip() == PROGRESS_ASSIGNEE_HEADER:
+                col = i
+                break
+    new_width = width if col is not None else width + 1
+    if col is None:
+        col = width
+
+    for idx, row in enumerate(rows):
+        cells = row["table_row"]["cells"]
+        # 列数を揃える
+        while len(cells) < new_width:
+            cells.append([])
+        if has_column_header and idx == 0:
+            cells[col] = _text_cell(PROGRESS_ASSIGNEE_HEADER)
+            continue
+        assignee = _lookup_assignee(_cell_plain_text(cells[0]) if cells else "")
+        if assignee:
+            cells[col] = _text_cell(assignee)
+        elif col >= width:
+            # 新設列で未登録の Client は空のまま
+            cells[col] = []
+        row["table_row"]["cells"] = cells[:new_width]
+
+    return rows, new_width
+
+
 def _copy_progress_from_previous(token: str, parent_page_id: str, current_page_id: str, toggle_id: str) -> bool:
     """過去ページから「プロジェクト進捗」を探してコピーする。最大5ページ遡る。"""
     children = _notion_api(token, "GET", f"blocks/{parent_page_id}/children?page_size=100")
@@ -626,10 +732,15 @@ def _copy_progress_from_previous(token: str, parent_page_id: str, current_page_i
                         "type": "table_row",
                         "table_row": {"cells": sanitized_cells},
                     })
+            rows, table_width = _apply_assignee_column(
+                rows,
+                b["table"]["table_width"],
+                b["table"]["has_column_header"],
+            )
             blocks_to_copy.append({
                 "type": "table",
                 "table": {
-                    "table_width": b["table"]["table_width"],
+                    "table_width": table_width,
                     "has_column_header": b["table"]["has_column_header"],
                     "has_row_header": b["table"].get("has_row_header", False),
                     "children": rows,
@@ -794,15 +905,7 @@ def export_to_notion(
     progress_toggle_id = _append_toggle_heading(token, child_page_id, "プロジェクト進捗")
     _copy_progress_from_previous(token, page_id, child_page_id, progress_toggle_id)
 
-    # 5. 「ピン留めタスク一覧」見出し + DB
-    _notion_api(token, "PATCH", f"blocks/{child_page_id}/children", {
-        "children": [{
-            "object": "block",
-            "type": "heading_2",
-            "heading_2": {"rich_text": [{"type": "text", "text": {"content": "ピン留めタスク一覧"}}]},
-        }],
-    })
-
+    # 5. 「ピン留めタスク一覧」DB（DBのタイトルが見出しになるため heading は付けない）
     db = _notion_api(token, "POST", "databases", {
         "parent": {"type": "page_id", "page_id": child_page_id},
         "title": [{"type": "text", "text": {"content": "ピン留めタスク一覧"}}],
