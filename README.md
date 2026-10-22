@@ -63,7 +63,7 @@ python get_pins.py --notion --public-only --exclude-assignees "担当者A" "担�
 
 ## GitHub Actions による自動実行
 
-[imtkzk/slack-pin](https://github.com/imtkzk/slack-pin) リポジトリの `.github/workflows/notion-export.yml` により、毎週木曜 16:00 (JST) に自動でNotionへエクスポートされます。手動実行（workflow_dispatch）も可能です。
+[imtkzk/slack-pin](https://github.com/imtkzk/slack-pin) リポジトリの `.github/workflows/notion-export.yml` により、毎週木曜 12:17 (JST) に自動でNotionへエクスポートされます（GitHubの予約実行は数時間遅れることがあるため早めに設定）。手動実行（workflow_dispatch）も可能です。同じ日付のページが既にある場合は作成をスキップします。
 
 必要なRepository Secrets:
 

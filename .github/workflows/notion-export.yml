@@ -2,8 +2,9 @@ name: Notion Export (Filtered)
 
 on:
   schedule:
-    # 毎週木曜 16:00 JST (= 07:00 UTC)
-    - cron: '0 7 * * 4'
+    # 毎週木曜 12:17 JST (= 03:17 UTC)
+    # 正時はGitHub側の混雑で数時間遅れるため、早め＆半端な分にずらしている
+    - cron: '17 3 * * 4'
   workflow_dispatch: # 手動実行も可能
 
 permissions:

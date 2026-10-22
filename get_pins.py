@@ -489,13 +489,35 @@ def _append_toggle_heading(token: str, parent_id: str, text: str) -> str:
     return result["results"][0]["id"]
 
 
+def _list_child_pages(token: str, parent_page_id: str) -> list[dict]:
+    """親ページ直下の子ページ（ゴミ箱以外）を全件取得する（100件超もページング）。"""
+    child_pages = []
+    cursor = None
+    while True:
+        path = f"blocks/{parent_page_id}/children?page_size=100"
+        if cursor:
+            path += f"&start_cursor={cursor}"
+        children = _notion_api(token, "GET", path)
+        child_pages += [
+            b for b in children.get("results", [])
+            if b["type"] == "child_page" and not b.get("in_trash")
+        ]
+        if not children.get("has_more"):
+            return child_pages
+        cursor = children["next_cursor"]
+
+
+def _find_page_by_title(token: str, parent_page_id: str, title: str) -> str | None:
+    """同じタイトルの子ページがあればそのIDを返す。"""
+    for page in _list_child_pages(token, parent_page_id):
+        if page["child_page"]["title"] == title:
+            return page["id"]
+    return None
+
+
 def _find_previous_page_id(token: str, parent_page_id: str, current_page_id: str) -> str | None:
     """親ページの子ページ一覧から、現在ページの一つ前のページIDを返す。"""
-    children = _notion_api(token, "GET", f"blocks/{parent_page_id}/children?page_size=100")
-    child_pages = [
-        b for b in children.get("results", [])
-        if b["type"] == "child_page" and not b.get("in_trash")
-    ]
+    child_pages = _list_child_pages(token, parent_page_id)
     # created_time降順でソート
     child_pages.sort(key=lambda b: b["created_time"], reverse=True)
     current_clean = current_page_id.replace("-", "")
@@ -676,11 +698,7 @@ def _apply_assignee_column(rows: list[dict], width: int, has_column_header: bool
 
 def _copy_progress_from_previous(token: str, parent_page_id: str, current_page_id: str, toggle_id: str) -> bool:
     """過去ページから「プロジェクト進捗」を探してコピーする。最大5ページ遡る。"""
-    children = _notion_api(token, "GET", f"blocks/{parent_page_id}/children?page_size=100")
-    child_pages = [
-        b for b in children.get("results", [])
-        if b["type"] == "child_page" and not b.get("in_trash")
-    ]
+    child_pages = _list_child_pages(token, parent_page_id)
     child_pages.sort(key=lambda b: b["created_time"], reverse=True)
     current_clean = current_page_id.replace("-", "")
 
@@ -781,6 +799,12 @@ def export_to_notion(
         sys.exit(1)
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # 0. 同日のページが既にあればスキップ（手動実行と定期実行の重複防止）
+    existing_id = _find_page_by_title(token, page_id, today)
+    if existing_id:
+        print(f"  {today} のページは作成済みのためスキップ", file=sys.stderr)
+        return f"https://www.notion.so/{existing_id.replace('-', '')}"
 
     # 1. 子ページを作成（タイトル = 日付）
     child_page = _notion_api(token, "POST", "pages", {
