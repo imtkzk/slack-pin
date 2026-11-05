@@ -6,6 +6,9 @@ on:
     # 正時はGitHub側の混雑で数時間遅れるため、早め＆半端な分にずらしている
     - cron: '17 3 * * 4'
   workflow_dispatch: # 手動実行も可能
+  # schedule の遅延対策。毎週木曜 15:30 JST に Claude の routine から起動する
+  repository_dispatch:
+    types: [hph-minutes]
 
 permissions:
   contents: read
